@@ -1,0 +1,14 @@
+# Không đưa các thư mục sinh ra khi build hoặc tệp không cần thiết vào build context.
+build/
+.gradle/
+.idea/
+*.iml
+bin/
+out/
+.git
+.gitignore
+*.md
+*.log
+.env
+Dockerfile
+.dockerignore

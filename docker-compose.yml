@@ -1,0 +1,80 @@
+# Docker Compose cho Campus Hub Guard: db (MySQL) + backend (Spring Boot) + web (nginx + React).
+# Cấu hình bí mật đọc từ tệp .env (xem .env.example). Chỉ dịch vụ web công khai cổng ra máy chủ.
+
+services:
+  # Cơ sở dữ liệu MySQL, dữ liệu lưu bền trong volume db-data.
+  db:
+    image: mysql:8.4
+    container_name: chg-db
+    restart: unless-stopped
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      TZ: Asia/Ho_Chi_Minh
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - app-net
+
+  # Backend Spring Boot; chỉ truy cập được trong mạng nội bộ app-net (web proxy tới đây).
+  backend:
+    build:
+      context: ./backend
+    image: campus-hub-guard-backend:local
+    container_name: chg-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:mysql://db:3306/${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Ho_Chi_Minh
+      DB_USERNAME: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      # Ngưỡng tự chuyển bài sang "đang kiểm duyệt" (app.moderation.auto-review-threshold).
+      # Khai báo nhiều dạng tên để khớp mọi cách Spring Boot đọc biến môi trường.
+      MODERATION_AUTO_REVIEW_THRESHOLD: ${MODERATION_AUTO_REVIEW_THRESHOLD:-3}
+      APP_MODERATION_AUTO_REVIEW_THRESHOLD: ${MODERATION_AUTO_REVIEW_THRESHOLD:-3}
+      APP_MODERATION_AUTOREVIEWTHRESHOLD: ${MODERATION_AUTO_REVIEW_THRESHOLD:-3}
+      # Phiên bản (mã commit) đang chạy, do deploy/deploy.sh truyền vào; backend không bắt buộc dùng.
+      APP_VERSION: ${APP_VERSION:-dev}
+      TZ: Asia/Ho_Chi_Minh
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - app-net
+
+  # Frontend: nginx phục vụ bản build React và proxy /api, /actuator/health tới backend.
+  web:
+    build:
+      context: ./frontend
+    image: campus-hub-guard-web:local
+    container_name: chg-web
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-80}:80"
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    driver: bridge
+
+volumes:
+  db-data:

@@ -1,0 +1,250 @@
+name: CI/CD - Campus Hub Guard
+
+# Kích hoạt: mọi lần push (mọi nhánh), pull request và chạy thủ công.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Hủy lượt chạy cũ của cùng một ref khi có lượt mới (riêng main thì xếp hàng để không hủy giữa chừng khi đang triển khai).
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Quyền mặc định tối thiểu; job đẩy image sẽ được cấp thêm packages: write.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BACKEND: ghcr.io/letoan0902/campus-hub-guard-backend
+  IMAGE_WEB: ghcr.io/letoan0902/campus-hub-guard-web
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. Kiểm thử backend (JUnit, H2 trong bộ nhớ)
+  # ---------------------------------------------------------------
+  backend-test:
+    name: Backend - kiểm thử
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Cài JDK 21 (Temurin)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Cấp quyền chạy cho gradlew
+        run: chmod +x gradlew
+
+      - name: Chạy kiểm thử
+        run: ./gradlew test --no-daemon
+
+      - name: Tải lên báo cáo kiểm thử
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-report
+          path: |
+            backend/build/reports/tests/test
+            backend/build/test-results/test
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # 2. Lint và build frontend
+  # ---------------------------------------------------------------
+  frontend-build:
+    name: Frontend - lint và build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Cài Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cài dependency
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Tải lên bản build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # 3. Build image cho linux/amd64 và đẩy lên GHCR (chỉ khi push vào main)
+  # ---------------------------------------------------------------
+  docker-images:
+    name: Docker - build và đẩy image
+    needs: [backend-test, frontend-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Thiết lập QEMU (build arm64 trên runner amd64)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Thiết lập Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Đăng nhập GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sinh thẻ (tag) cho image backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BACKEND }}
+          tags: |
+            type=sha
+            type=raw,value=latest
+
+      - name: Sinh thẻ (tag) cho image web
+        id: meta-web
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_WEB }}
+          tags: |
+            type=sha
+            type=raw,value=latest
+
+      - name: Build và đẩy image backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build và đẩy image web
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-web.outputs.tags }}
+          labels: ${{ steps.meta-web.outputs.labels }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  # ---------------------------------------------------------------
+  # 4. Triển khai lên máy chủ Oracle Cloud qua SSH (chỉ trên main)
+  # ---------------------------------------------------------------
+  deploy:
+    name: Triển khai lên máy chủ
+    needs: docker-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://161.118.239.231
+    permissions:
+      contents: read
+    env:
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+    steps:
+      - name: Kiểm tra cấu hình triển khai
+        env:
+          SSH_KEY_VALUE: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          missing=0
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_PATH; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Thiếu biến (variable) ${name} trong GitHub Actions"
+              missing=1
+            fi
+          done
+          if [ -z "$SSH_KEY_VALUE" ]; then
+            echo "::error::Thiếu secret DEPLOY_SSH_KEY"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Nạp khóa SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Thêm máy chủ vào known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -T 15 -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Chạy script triển khai trên máy chủ
+        run: |
+          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
+            "$DEPLOY_USER@$DEPLOY_HOST" "DEPLOY_PATH='$DEPLOY_PATH' bash '$DEPLOY_PATH/deploy/deploy.sh'"
+
+      - name: Kiểm tra sức khỏe sau triển khai
+        run: |
+          ok=0
+          for i in $(seq 1 10); do
+            if curl -fsS -m 10 "http://$DEPLOY_HOST/actuator/health"; then
+              echo
+              ok=1
+              break
+            fi
+            echo "Lần $i/10: chưa sẵn sàng, thử lại sau 6 giây"
+            sleep 6
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Health check thất bại sau 10 lần thử"
+            exit 1
+          fi
+          code=$(curl -fsS -m 10 -o /dev/null -w '%{http_code}' "http://$DEPLOY_HOST/")
+          echo "Trang chủ trả về HTTP $code"
+          test "$code" = "200"
+
+      - name: Ghi tóm tắt triển khai
+        if: always()
+        run: |
+          {
+            echo "## Kết quả triển khai"
+            echo
+            echo "- Commit đang chạy: \`${GITHUB_SHA}\`"
+            echo "- Địa chỉ: http://${DEPLOY_HOST}"
+            echo "- Trạng thái job: ${{ job.status }}"
+            echo "- Lượt chạy: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,22 @@
+# Bí mật và cấu hình cục bộ
+.env
+.deploy-info
+
+# Nhật ký
+*.log
+
+# Thư mục sinh ra khi build
+backend/build/
+backend/.gradle/
+backend/target/
+frontend/node_modules/
+frontend/dist/
+
+# IDE và hệ điều hành
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+!frontend/package.json
+!frontend/package-lock.json
